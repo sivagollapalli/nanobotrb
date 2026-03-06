@@ -1,374 +1,273 @@
-# nanobot Architecture
+# Nanobotrb Architecture
 
-> Ultra-lightweight personal AI assistant (~4,000 lines of core Python + TypeScript WhatsApp bridge)
+> 🎨 Vibe coded Ruby port of [nanobot](https://github.com/liunux4odoo/nanobot) (Python).
+> Slimmed down to the essentials: Telegram channel, tool-calling agent loop, async message bus.
 
 ## Overview
 
-nanobot is a multi-channel, multi-provider AI assistant framework. It connects to chat platforms (Telegram, Discord, WhatsApp, Slack, etc.), routes messages through an async bus to a central agent loop, calls LLM providers with tool-use capabilities, and sends responses back.
+Nanobotrb is a lightweight AI assistant framework in Ruby. It connects to Telegram, routes messages through an async bus to a central agent loop, calls any OpenAI-compatible LLM with tool-use capabilities, and sends responses back.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        User                                 │
-│   Telegram │ Discord │ WhatsApp │ Slack │ Email │ CLI │ ... │
-└──────┬─────┴────┬────┴────┬─────┴───┬───┴───┬───┴──┬──┘
-       │          │         │         │       │      │
-       ▼          ▼         ▼         ▼       ▼      ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Channel Layer                            │
-│  BaseChannel implementations (one per platform)             │
-│  - Permission checks (allow_from)                           │
-│  - Platform-specific message parsing                        │
-│  - Media handling (images, voice, documents)                │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ InboundMessage
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    MessageBus                               │
-│  Two async queues:                                          │
-│  - inbound:  Channel → Agent                                │
-│  - outbound: Agent → Channel                                │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    AgentLoop                                │
-│  1. Consume message from bus                                │
-│  2. Build context (system prompt + history + memory)        │
-│  3. Call LLM with tools                                     │
-│  4. Execute tool calls (iterative loop, max 40 iterations)  │
-│  5. Consolidate memory if window exceeded                   │
-│  6. Publish response to bus                                 │
-└────┬──────────┬──────────┬──────────┬───────────────────────┘
-     │          │          │          │
-     ▼          ▼          ▼          ▼
-  LLM Provider  Tools   Memory    Sessions
+┌───────────────────────────────────────┐
+│               User                    │
+│       Telegram │ CLI                  │
+└─────────┬──────┴──┬──────────────────┘
+          │         │
+          ▼         ▼
+┌───────────────────────────────────────┐
+│           Channel Layer               │
+│  BaseChannel → TelegramChannel        │
+│  - Permission checks (allow_from)     │
+│  - Message parsing                    │
+└──────────────┬────────────────────────┘
+               │ InboundMessage
+               ▼
+┌───────────────────────────────────────┐
+│           MessageBus                  │
+│  Two Async queues:                    │
+│  - inbound:  Channel → Agent          │
+│  - outbound: Agent → Channel          │
+└──────────────┬────────────────────────┘
+               │
+               ▼
+┌───────────────────────────────────────┐
+│           AgentLoop                   │
+│  1. Consume message from bus          │
+│  2. Build context (prompt + history)  │
+│  3. Call LLM with tools               │
+│  4. Execute tool calls (max 40 iter)  │
+│  5. Consolidate memory if needed      │
+│  6. Publish response to bus           │
+└───┬────────┬────────┬────────┬───────┘
+    │        │        │        │
+    ▼        ▼        ▼        ▼
+ Provider  Tools   Memory   Sessions
+```
+
+## What's different from the Python original
+
+| Feature | Python nanobot | nanobotrb |
+|---|---|---|
+| Channels | 10+ (Telegram, Discord, WhatsApp, Slack, etc.) | Telegram + CLI |
+| Async | asyncio | Async gem (fiber-based) |
+| LLM | LiteLLM with provider registry | Direct OpenAI-compatible HTTP |
+| Tools | 10+ including MCP, spawn, cron | 4 (web_search, read_file, write_file, exec) |
+| Subagents | Yes (spawn tool) | Not implemented |
+| Cron | Yes (at/every/cron) | Not implemented |
+| Heartbeat | Yes | Not implemented |
+| Skills | Markdown-based progressive loading | Not implemented |
+| MCP | stdio + HTTP transports | Not implemented |
+
+---
+
+## Project Structure
+
+```
+lib/nanobotrb/
+├── bus/
+│   ├── message_bus.rb      # Async inbound/outbound queues
+│   └── messages.rb         # InboundMessage / OutboundMessage data classes
+├── channels/
+│   ├── base.rb             # BaseChannel with permission checks
+│   ├── manager.rb          # Routes outbound messages to channels
+│   └── telegram.rb         # Telegram bot via telegram-bot-ruby
+├── agent/
+│   ├── loop.rb             # Core processing engine
+│   ├── context_builder.rb  # System prompt assembly
+│   ├── memory.rb           # MEMORY.md + HISTORY.md persistence
+│   └── tools/
+│       ├── base.rb         # Tool ABC
+│       ├── registry.rb     # Central tool registry
+│       ├── web_search.rb   # Google search via SerpApi
+│       ├── read_file.rb    # File reading
+│       ├── write_file.rb   # File writing
+│       └── exec.rb         # Shell command execution
+├── providers/
+│   ├── base.rb             # LLMResponse data class + provider ABC
+│   └── ruby_llm_provider.rb  # Direct OpenAI-compatible HTTP calls
+├── session/
+│   └── manager.rb          # JSONL session storage
+├── config.rb               # JSON config with defaults
+├── cli.rb                  # Thor CLI
+└── version.rb
 ```
 
 ---
 
 ## Entry Points
 
-nanobot has two main execution modes, both driven by the Typer CLI (`nanobot/cli/commands.py`):
+Two execution modes via Thor CLI:
 
 | Command | What it does |
 |---|---|
-| `nanobot agent` | Interactive CLI chat (or single-shot with `-m "message"`) |
-| `nanobot gateway` | Multi-channel server: starts all enabled channels, cron, heartbeat |
-| `nanobot onboard` | First-time setup: creates `~/.nanobot/config.json` and workspace |
-| `nanobot status` | Shows config, provider keys, workspace status |
-| `nanobot channels status` | Shows which channels are enabled |
-| `nanobot channels login` | Links WhatsApp via QR code (starts the Node.js bridge) |
-| `nanobot provider login <name>` | OAuth login for providers like OpenAI Codex |
+| `nanobotrb agent` | Interactive CLI chat (or single-shot with `-m "message"`) |
+| `nanobotrb gateway` | Telegram bot server: starts channel + agent loop |
+| `nanobotrb onboard` | First-time setup: creates `~/.nanobotrb/` |
+| `nanobotrb status` | Shows config, provider keys, channel status |
+| `nanobotrb version` | Shows version |
 
-### How `nanobot agent` works
+### How `agent` works
 
-```python
+```ruby
 # Single message mode
-nanobot agent -m "What's the weather?"
+nanobotrb agent -m "What's the weather?"
 # → Creates AgentLoop, calls process_direct(), prints response, exits
 
 # Interactive mode
-nanobot agent
-# → Creates AgentLoop, starts bus consumer loop
-# → Uses prompt_toolkit for input (history, paste support)
-# → Publishes InboundMessage to bus → AgentLoop processes → OutboundMessage consumed and printed
+nanobotrb agent
+# → Creates AgentLoop + MessageBus
+# → Reads from stdin, publishes to bus, prints outbound responses
 ```
 
-### How `nanobot gateway` works
+### How `gateway` works
 
-```python
-# Starts everything concurrently:
-asyncio.gather(
-    agent.run(),           # AgentLoop consuming from bus
-    channels.start_all(),  # All enabled channels listening
-)
-# Plus: CronService.start(), HeartbeatService.start()
+```ruby
+Async do |task|
+  task.async { agent_loop.run }           # AgentLoop consuming from bus
+  task.async { channel_manager.start_all } # Telegram + outbound dispatcher
+end
 ```
 
 ---
 
 ## Core Components
 
-### 1. MessageBus (`nanobot/bus/`)
+### 1. MessageBus (`bus/message_bus.rb`)
 
-The decoupling layer between channels and the agent. Two `asyncio.Queue`s:
+Decoupling layer between channels and the agent. Two queues backed by arrays + `Async::Condition` for signaling:
 
 - `inbound`: Channels push `InboundMessage` (channel, sender_id, chat_id, content, media, metadata)
 - `outbound`: Agent pushes `OutboundMessage` (channel, chat_id, content, reply_to, media)
 
-The `ChannelManager` dispatches outbound messages to the correct channel based on `msg.channel`.
+Messages are Ruby `Data.define` value objects (immutable).
 
-### 2. Channel System (`nanobot/channels/`)
+### 2. Channel System (`channels/`)
 
-Each channel extends `BaseChannel` with `start()`, `stop()`, `send()`:
+`BaseChannel` provides:
+- `start` / `stop` / `send_message` interface
+- `allowed?(sender_id)` permission check via `allow_from` list
+- `publish_inbound` helper that checks permissions before pushing to bus
 
-| Channel | Transport | Notes |
-|---|---|---|
-| Telegram | python-telegram-bot | Proxy support, voice transcription via Groq |
-| Discord | Raw WebSocket gateway | Message content intent, thread support |
-| WhatsApp | WebSocket to Node.js bridge | Baileys library, QR auth |
-| Feishu/Lark | WebSocket long connection | App ID/secret, emoji reactions |
-| Slack | Socket Mode SDK | No public IP needed, thread replies |
-| DingTalk | Stream mode | Staff ID allowlist |
-| Email | IMAP polling + SMTP | Auto-reply, configurable poll interval |
-| Matrix | matrix-nio with E2EE | Encrypted rooms, media handling |
-| QQ | botpy SDK | Sandbox testing support |
-| Mochat | Socket.IO | Mention-based reply delay |
+`TelegramChannel` uses `telegram-bot-ruby` gem:
+- Long-polling via `bot.listen`
+- Markdown message sending with fallback to plain text
+- Message splitting for Telegram's 4096 char limit
+- Metadata extraction (username, message_id)
 
-Permission model: each channel has an `allow_from` list. Empty = deny all, `["*"]` = allow all.
+`ChannelManager` registers channels and dispatches outbound messages to the correct one.
 
-### 3. AgentLoop (`nanobot/agent/loop.py`)
+### 3. AgentLoop (`agent/loop.rb`)
 
 The core processing engine. For each inbound message:
 
 ```
 1. Get/create session (keyed by channel:chat_id)
 2. Handle special commands (/new, /stop, /help)
-3. Initialize MCP servers (lazy, first message only)
-4. Build context via ContextBuilder
-5. LLM call loop (up to max_iterations=40):
-   a. Call provider.chat(messages, tools, model, ...)
+3. Build context via ContextBuilder
+4. LLM call loop (up to max_iterations=40):
+   a. Call provider.chat(messages, tools)
    b. If response has tool_calls → execute each via ToolRegistry
    c. Append tool results to messages
    d. Repeat until no more tool calls or max iterations
-6. Save turn to session (append-only JSONL)
-7. Consolidate memory if unconsolidated messages ≥ memory_window
-8. Publish OutboundMessage to bus
+5. Save turn to session (append-only JSONL)
+6. Consolidate memory if unconsolidated messages ≥ memory_window
+7. Publish OutboundMessage to bus
 ```
 
-### 4. ContextBuilder (`nanobot/agent/context.py`)
+### 4. ContextBuilder (`agent/context_builder.rb`)
 
-Assembles the system prompt from multiple sources:
+Assembles the system prompt:
 
 ```
-Identity (runtime info, workspace path, guidelines)
-  + Bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md, IDENTITY.md)
+Runtime info (time, version)
+  + Guidelines
   + Long-term memory (MEMORY.md)
-  + Always-on skills
-  + Skills summary (for progressive loading)
 ```
 
-Also builds user messages with runtime context (current time, channel, chat_id) and handles multimodal content (base64-encoded images).
+Builds user messages with runtime context (current time, channel, chat_id).
 
-### 5. Memory System (`nanobot/agent/memory.py`)
+### 5. Memory System (`agent/memory.rb`)
 
 Two-layer persistent memory:
 
-- `MEMORY.md` — Long-term facts (updated by LLM via `save_memory` tool call)
-- `HISTORY.md` — Grep-searchable timestamped log
+- `MEMORY.md` — Long-term facts (updated via LLM consolidation)
+- `HISTORY.md` — Timestamped conversation summaries
 
-Consolidation is triggered when unconsolidated messages exceed `memory_window` (default 100). The LLM summarizes old messages into a history entry and updates long-term memory. Messages themselves are append-only (never deleted) for LLM cache efficiency.
+Consolidation triggers when unconsolidated messages exceed `memory_window` (default 100). The LLM summarizes old messages and the result is appended to HISTORY.md.
 
-### 6. Session Management (`nanobot/session/manager.py`)
+### 6. Session Management (`session/manager.rb`)
 
 - Sessions stored as JSONL files (one message per line)
 - Key format: `channel:chat_id` (e.g., `telegram:12345`)
 - Tracks `last_consolidated` index for memory consolidation offset
 - `get_history()` returns unconsolidated messages, aligned to start at a user turn
+- Metadata stored in separate `.meta.json` files
 
-### 7. Provider System (`nanobot/providers/`)
+### 7. Provider (`providers/ruby_llm_provider.rb`)
 
-**Registry** (`registry.py`): A tuple of `ProviderSpec` dataclasses defining all supported providers. Each spec includes:
-- Keywords for model matching (e.g., "claude" → Anthropic)
-- LiteLLM prefix for model routing
-- Gateway detection (by API key prefix or base URL substring)
-- Per-model parameter overrides
+Direct HTTP calls to any OpenAI-compatible endpoint (no RubyLLM chat abstraction):
 
-**Provider matching priority:**
-1. Forced provider (explicit in config)
-2. Explicit prefix in model name (`anthropic/claude-opus`)
-3. Keyword matching
-4. Gateway detection
-5. Fallback to first available with API key
+- Sends `system`, `user`, `assistant`, `tool` roles directly
+- System prompt folded into first user message to avoid `developer` role issues with some endpoints
+- Full tool-calling protocol: sends tool definitions, parses `tool_calls` responses
+- Works with OpenAI, Abacus RouteLLM, or any compatible API
 
-**Provider types:**
-- Standard: Anthropic, OpenAI, DeepSeek, Gemini, Groq, Zhipu, Qwen, Moonshot, MiniMax
-- Gateways: OpenRouter, AiHubMix, SiliconFlow, VolcEngine (route any model)
-- Local: vLLM, Ollama-compatible
-- Direct: Custom OpenAI-compatible endpoints (bypass LiteLLM)
-- OAuth: OpenAI Codex, GitHub Copilot
+`LLMResponse` contains: content, tool_calls, finish_reason, usage.
 
-**Base interface** (`base.py`):
-```python
-class LLMProvider(ABC):
-    async def chat(messages, tools, model, max_tokens, temperature, reasoning_effort) -> LLMResponse
-    def get_default_model() -> str
-```
+### 8. Tool System (`agent/tools/`)
 
-`LLMResponse` contains: content, tool_calls, finish_reason, usage, reasoning_content, thinking_blocks.
-
-### 8. Tool System (`nanobot/agent/tools/`)
-
-Tools extend `Tool` ABC with `name`, `description`, `parameters` (JSON Schema), and `execute()`.
+Tools extend `Base` with `name`, `description`, `parameters` (JSON Schema), and `execute`:
 
 | Tool | What it does |
 |---|---|
-| `read_file` | Read file contents (with workspace restriction option) |
-| `write_file` | Write/create files |
-| `edit_file` | Surgical edits (old_string → new_string) |
-| `list_dir` | List directory contents |
+| `web_search` | Google search via SerpApi for up-to-date information |
+| `read_file` | Read file contents (truncates at 100KB) |
+| `write_file` | Write/create files (creates directories as needed) |
 | `exec` | Shell command execution (timeout, dangerous command blocking) |
-| `web_search` | Brave Search API |
-| `web_fetch` | HTTP fetch with readability extraction |
-| `message` | Send to a specific channel/chat (bypasses normal response flow) |
-| `spawn` | Launch background subagents |
-| `cron` | Schedule tasks (at/every/cron expressions) |
-| `mcp_*` | Dynamic tools from MCP servers |
 
-**ToolRegistry**: Central registry with `register()`, `get_definitions()` (for LLM), `execute()`.
-
-**MCP Integration** (`mcp.py`): Lazy-loaded on first message. Supports stdio (local) and HTTP (remote) transports. Each MCP tool is wrapped as a native nanobot `Tool` with name prefix `mcp_{server}_{tool}`.
-
-### 9. Subagent System (`nanobot/agent/subagent.py`)
-
-Background task execution via the `spawn` tool:
-
-- Each subagent gets a focused system prompt, limited tools (no message/spawn/cron), max 15 iterations
-- Results announced back to main agent via system message
-- Cancellable per session (`/stop` command)
-- Tracked by session key for cleanup
-
-### 10. Skills System (`nanobot/agent/skills.py`)
-
-Skills are markdown files (`SKILL.md`) that teach the agent how to use specific tools:
-
-- Loaded from workspace (`skills/`) and builtin (`nanobot/skills/`)
-- YAML frontmatter for metadata (description, requirements, always flag)
-- Requirements checking: CLI binaries, environment variables
-- Progressive loading: summary in system prompt, full content loaded on-demand via `read_file`
-- Built-in skills: clawhub, cron, github, memory, skill-creator, summarize, tmux, weather
-
-### 11. Cron Service (`nanobot/cron/service.py`)
-
-Scheduled task execution:
-
-- Schedule types: `at` (one-shot timestamp), `every` (interval ms), `cron` (cron expression with timezone)
-- Persistent storage in `jobs.json`
-- Auto-reloads on external file modification
-- Callback-based: when a job fires, it calls `on_job` which routes through `AgentLoop.process_direct()`
-- Job results can be delivered to a specific channel/chat
-
-### 12. Heartbeat Service (`nanobot/heartbeat/service.py`)
-
-Periodic agent wake-up (default every 30 minutes):
-
-1. **Decision phase**: Reads `HEARTBEAT.md`, asks LLM via virtual tool call whether there are active tasks
-2. **Execution phase**: If LLM returns `run`, executes tasks through the full agent loop
-3. **Delivery**: Results sent to the most recently active channel
-
----
-
-## WhatsApp Bridge (`bridge/`)
-
-A separate Node.js/TypeScript component using the Baileys library (WhatsApp Web reverse engineering):
-
-```
-WhatsApp Web ←→ Baileys ←→ BridgeServer (WebSocket on localhost:3001) ←→ Python WhatsAppChannel
-```
-
-- Security: localhost-only binding, optional `BRIDGE_TOKEN` authentication
-- Handles QR code generation, message forwarding (text, images, video, documents, voice), reconnection
-- Built separately (`npm install && npm run build`), auto-setup on first `nanobot channels login`
+`Registry` provides `register()`, `definitions` (for LLM), `execute(name, **args)`.
 
 ---
 
 ## Configuration
 
-Config file: `~/.nanobot/config.json` (Pydantic-validated, supports both camelCase and snake_case)
+Config file: `~/.nanobotrb/config.json`
 
 ```
 Config
-├── agents.defaults (model, provider, temperature, max_tokens, memory_window, reasoning_effort)
-├── channels (per-channel: enabled, tokens, allow_from, etc.)
-├── providers (per-provider: api_key, api_base, extra_headers)
-├── gateway (host, port, heartbeat interval)
-└── tools (web search key, exec timeout, restrict_to_workspace, mcp_servers)
+├── model, temperature, max_tokens, memory_window, max_iterations
+├── providers
+│   └── openai (api_key, api_base)
+├── channels
+│   └── telegram (enabled, token, allow_from)
+└── tools (serpapi_key, exec_timeout, restrict_to_workspace)
 ```
 
-Workspace: `~/.nanobot/workspace/` (sessions, memory, skills, templates)
+Workspace: `~/.nanobotrb/workspace/` (sessions/, memory/)
 
 ---
 
-## Docker Deployment
-
-```yaml
-# docker-compose.yml
-services:
-  nanobot-gateway:
-    build: .
-    command: ["gateway"]
-    ports: ["18790:18790"]
-    volumes: ["~/.nanobot:/root/.nanobot"]
-```
-
-Base image: `ghcr.io/astral-sh/uv:python3.12-bookworm-slim` with Node.js 20 for the bridge.
-
----
-
-## Data Flow Examples
-
-### User sends "Hello" via Telegram
+## Data Flow: User sends "Hello" via Telegram
 
 ```
-1. TelegramChannel receives update from Telegram API
-2. _handle_message() checks allow_from → allowed
-3. Publishes InboundMessage(channel="telegram", chat_id="12345", content="Hello")
-4. AgentLoop.run() consumes from bus.inbound
+1. TelegramChannel receives update via long-polling
+2. handle_message() checks allow_from → allowed
+3. Publishes InboundMessage(channel: "telegram", chat_id: "12345", content: "Hello")
+4. AgentLoop.run consumes from bus.inbound
 5. Gets/creates Session("telegram:12345")
 6. ContextBuilder assembles system prompt + history + memory
-7. provider.chat(messages, tools) → LLM returns text response
-8. Session saves turn (append to JSONL)
-9. Publishes OutboundMessage(channel="telegram", chat_id="12345", content="Hi there!")
-10. ChannelManager routes to TelegramChannel.send()
-11. Telegram API delivers message to user
-```
-
-### Cron job fires
-
-```
-1. CronService timer triggers for job
-2. Calls on_job callback → AgentLoop.process_direct(reminder_note)
-3. Agent processes with full tool access
-4. If job.payload.deliver: publishes OutboundMessage to target channel
-```
-
-### Memory consolidation
-
-```
-1. After processing a turn, check: unconsolidated messages ≥ memory_window?
-2. If yes: call LLM with consolidation prompt + save_memory tool
-3. LLM returns tool call: save_memory(history_entry="...", memory_update="...")
-4. Append history_entry to HISTORY.md
-5. Write memory_update to MEMORY.md
-6. Update session.last_consolidated index
+7. provider.chat(messages, tools) → HTTP POST to LLM endpoint
+8. LLM returns text response (or tool_calls → execute → loop)
+9. Session saves turn (append to JSONL)
+10. Publishes OutboundMessage(channel: "telegram", chat_id: "12345", content: "Hi!")
+11. ChannelManager routes to TelegramChannel.send_message
+12. Telegram API delivers message to user
 ```
 
 ---
-
-## How to Run
-
-```bash
-# Install
-pip install nanobot-ai
-
-# First-time setup
-nanobot onboard
-
-# Add API key to ~/.nanobot/config.json (e.g., OpenRouter key)
-
-# Chat
-nanobot agent -m "Hello!"    # single message
-nanobot agent                 # interactive mode
-
-# Multi-channel server
-nanobot gateway
-
-# Docker
-docker compose up -d nanobot-gateway
-```
 
 ## Dependencies
 
-Core: typer, litellm, pydantic, httpx, loguru, rich, prompt-toolkit, mcp, croniter
-Channels: python-telegram-bot, slack-sdk, qq-botpy, dingtalk-stream, lark-oapi, matrix-nio, websockets
-Bridge: @whiskeysockets/baileys, ws, qrcode-terminal
+Core: async, thor, json, logger, net/http
+Channel: telegram-bot-ruby
+Search: serpapi

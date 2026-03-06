@@ -15,8 +15,7 @@ module Nanobotrb
         @api_key = ENV.fetch("ABACUS_KEY", nil) ||
                    config.dig("providers", "openai", "api_key") ||
                    ENV.fetch("OPENAI_API_KEY", nil)
-        @api_base = config.dig("providers", "openai", "api_base") ||
-                    "https://routellm.abacus.ai/v1"
+        @api_base = ENV.fetch('ABACUS_URL', nil)
       end
 
       def chat(messages:, tools: [], model: nil, max_tokens: nil, temperature: nil)
